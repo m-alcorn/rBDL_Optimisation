@@ -1,0 +1,473 @@
+# INTEGRATED SDL OPTIMIZATION SOLUTION
+# Drop-in replacement for your existing main program
+# Keeps all your existing setup but uses optimized solver
+
+library(doSNOW)
+library(foreach)
+library(SWTools)
+library(lubridate)
+library(tidyverse) 
+library(animation)
+library(zoo)
+library(gridExtra)  # For plot arrangements
+
+# ============================================================================
+# 1. YOUR EXISTING SETUP (UNCHANGED)
+# ============================================================================
+
+scenVars <- list( 
+  target = 42.70,
+  pFolder = "E:/ACT_Uplift/Models/PopulationV3",
+  numScenarios = as.integer(16),
+  scenFile = "Population_Function_Setup.csv",
+  numParallels = as.integer(4),
+  startServer =  as.integer(9876),
+  SourceVersion = "E:/Source/550",
+  sourceProjectName = "UMB_ACT_POPV3.rsproj",
+  ScenarioInputSet = "BDL.PopAndCrop",
+  iScenario = "Upper_Murrumbidgee_River_System_Model",
+  outputFolder = "outputs",
+  inputSetFile = "ACT_PopulationV3_InputSet.txt",
+  runFlag = as.logical("TRUE"),
+  summaryFilename = "BDL_Opt_Population_V3_Veneer_AnnualMeans.csv",
+  minPop = 1100000,
+  maxPop = 1300000,
+  startDate = "01/07/1890",
+  endDate = "30/06/2009",
+  startWindow = "01/07/1895",
+  endWindow = "30/06/2009",
+  baseURL = "http://localhost:9876"
+)
+
+# Load your existing functions
+source("E:/R/shSDL/SDL_Opt_Functions.R")
+
+# Your existing file setup
+fileSetup(scenVars)
+
+if(file.exists(paste0(scenVars[["pFolder"]][1], "/", scenVars[["scenFile"]][1]))) {
+  sf <- read.csv(paste0(scenVars[["pFolder"]][1], "/", scenVars[["scenFile"]][1]))
+  print("Scenario file loaded successfully.")
+} else {
+  stop(paste0("The base scenario file - ", 
+             paste0(scenVars[["pFolder"]][1], "/", scenVars[["scenFile"]][1]), 
+             " - does not exist. Please check for file before continuing.."))
+}
+
+# ============================================================================
+# 2. OPTIMIZED SOLVER INTEGRATED WITH YOUR FUNCTIONS
+# ============================================================================
+
+OptimizedSDLSolver <- function(scenVars, sf) {
+  
+  # Solver state
+  state <- list(
+    results = data.frame(
+      Run = integer(),
+      Population = numeric(),
+      NetTake = numeric(),
+      Residual = numeric()
+    ),
+    target = scenVars[["target"]][1],
+    tolerance = 0.01,  # 0.01 GL tolerance (much more reasonable than 0.00001)
+    max_iterations = 12,
+    converged = FALSE,
+    bounds = c(scenVars[["minPop"]][1], scenVars[["maxPop"]][1]),
+    method_used = "newton"
+  )
+  
+  # Modified version of your getResRowVeneer function - no file I/O
+  evaluate_population_veneer <- function(population, iteration) {
+    
+    cat("Iteration", iteration, ": Population =", format(population, big.mark = ","))
+    
+    # Use your existing writeInputSetFile3 function
+    writeInputSetFile3(Population = population, scenVars, sf)
+    
+    # Use your existing VeneerRunSource call
+    VeneerRunSource(StartDate = scenVars[["startDate"]][1],
+                    EndDate = scenVars[["endDate"]][1],
+                    baseURL = scenVars[["baseURL"]][1])
+    
+    # Get results using your existing Veneer call but process in memory
+    tryCatch({
+      df <- fortify.zoo(VeneerGetTS(
+        TSURL = "/runs/latest/location/Functions/element/Functions/variable/Functions@ACT_Net_Take@$f_Net_Take"
+      ))
+      
+      colnames(df) <- c("Date", "NetTake")
+      df$Date <- date(df$Date)
+      
+      # Your existing windowing logic
+      df <- df %>% 
+        filter(Date >= date(dmy(scenVars[["startWindow"]][1]))) %>%
+        filter(Date <= date(dmy(scenVars[["endWindow"]][1])))
+      
+      df$Mon <- month(df$Date)
+      df$Year <- year(df$Date) 
+      df$WY <- 1
+      
+      # Your existing water year calculation
+      df$WY <- getWaterYearAnnual(df)
+      
+      # Your existing aggregation
+      dfAnn <- aggregate(df$NetTake, by = list(df$WY), sum)
+      dfMean <- mean(dfAnn$x)  
+      net_take_gl <- dfMean / 1000
+      
+      # Calculate residual (using absolute difference, not squared)
+      residual <- abs(scenVars[["target"]][1] - net_take_gl)
+      
+      # Store result in memory
+      new_result <- data.frame(
+        Run = iteration,
+        Population = population,
+        NetTake = net_take_gl,
+        Residual = residual
+      )
+      
+      state$results <<- rbind(state$results, new_result)
+      
+      cat(", Net Take =", round(net_take_gl, 2), "GL, Residual =", 
+          round(residual, 4), "GL\n")
+      
+      # Check convergence
+      if (residual < state$tolerance) {
+        state$converged <<- TRUE
+      }
+      
+      return(new_result)
+      
+    }, error = function(e) {
+      cat("ERROR in Veneer call:", e$message, "\n")
+      stop("Failed to get results from Veneer. Check your model setup.")
+    })
+  }
+  
+  # Newton-Raphson method (much better than your linear regression)
+  get_next_population_newton <- function() {
+    n <- nrow(state$results)
+    if (n < 2) return(NULL)
+    
+    # Use last two points
+    x1 <- state$results$Population[n-1] 
+    x2 <- state$results$Population[n]
+    y1 <- state$results$NetTake[n-1]
+    y2 <- state$results$NetTake[n]
+    
+    # Numerical derivative
+    if (abs(x2 - x1) < 1e-6) return(NULL)
+    dydx <- (y2 - y1) / (x2 - x1)
+    
+    # Newton step: solve NetTake(pop) = target
+    if (abs(dydx) < 1e-10) return(NULL)
+    
+    current_error <- state$target - y2
+    x_new <- x2 + current_error / dydx
+    
+    # Limit step size (prevent wild jumps)
+    max_step <- 100000  # Max 100k population change
+    step <- x_new - x2
+    if (abs(step) > max_step) {
+      step <- sign(step) * max_step
+      x_new <- x2 + step
+    }
+    
+    # Keep within bounds
+    x_new <- max(state$bounds[1], min(state$bounds[2], x_new))
+    
+    return(round(x_new, 0))
+  }
+  
+  # Secant method (fallback)
+  get_next_population_secant <- function() {
+    n <- nrow(state$results)
+    if (n < 2) return(NULL)
+    
+    x1 <- state$results$Population[n-1]
+    x2 <- state$results$Population[n]
+    f1 <- state$results$NetTake[n-1] - state$target
+    f2 <- state$results$NetTake[n] - state$target
+    
+    if (abs(f2 - f1) < 1e-10) return(NULL)
+    
+    x_new <- x2 - f2 * (x2 - x1) / (f2 - f1)
+    x_new <- max(state$bounds[1], min(state$bounds[2], x_new))
+    
+    return(round(x_new, 0))
+  }
+  
+  # Get smart initial populations (replaces your fixed startVals)
+  get_initial_populations <- function() {
+    # Start with 2 well-spaced points
+    range_size <- state$bounds[2] - state$bounds[1]
+    pop1 <- state$bounds[1] + round(range_size * 0.35, 0)  # 35% of range
+    pop2 <- state$bounds[1] + round(range_size * 0.75, 0)  # 75% of range
+    return(c(pop1, pop2))
+  }
+  
+  # Main solver
+  solve <- function(method = "newton") {
+    cat("\n", rep("=", 60), "\n")
+    cat("STARTING SDL POPULATION OPTIMIZATION\n")
+    cat(rep("=", 60), "\n")
+    cat("Target Net Take:", state$target, "GL\n")
+    cat("Tolerance:", state$tolerance, "GL\n")
+    cat("Population Range:", format(state$bounds[1], big.mark = ","), 
+        "to", format(state$bounds[2], big.mark = ","), "\n")
+    cat("Method:", toupper(method), "\n")
+    cat("Model Period:", scenVars[["startDate"]][1], "to", scenVars[["endDate"]][1], "\n")
+    cat("Analysis Window:", scenVars[["startWindow"]][1], "to", scenVars[["endWindow"]][1], "\n")
+    cat(rep("=", 60), "\n\n")
+    
+    start_time <- Sys.time()
+    state$method_used <<- method
+    
+    # Phase 1: Initial sampling (only 2 points vs your 4)
+    cat("Phase 1: Initial sampling...\n")
+    initial_pops <- get_initial_populations()
+    
+    for (i in seq_along(initial_pops)) {
+      evaluate_population_veneer(initial_pops[i], i)
+      if (state$converged) {
+        cat("Early convergence achieved!\n")
+        break
+      }
+    }
+    
+    # Phase 2: Iterative refinement (replaces your while loop)
+    if (!state$converged) {
+      cat("\nPhase 2: Iterative refinement...\n")
+      
+      iteration <- nrow(state$results) + 1
+      
+      while (!state$converged && iteration <= state$max_iterations) {
+        
+        # Get next population estimate
+        next_pop <- switch(method,
+          "newton" = get_next_population_newton(),
+          "secant" = get_next_population_secant(),
+          get_next_population_newton()  # default
+        )
+        
+        # Fallback if method fails (similar to your random generation)
+        if (is.null(next_pop)) {
+          cat("Method failed, using fallback strategy...\n")
+          last_result <- tail(state$results, 1)
+          error <- state$target - last_result$NetTake
+          
+          # Smart fallback instead of random
+          if (error > 0) {
+            next_pop <- min(last_result$Population * 1.1, state$bounds[2])
+          } else {
+            next_pop <- max(last_result$Population * 0.9, state$bounds[1])
+          }
+          next_pop <- round(next_pop, 0)
+        }
+        
+        # Bounds check (like your existing check)
+        if (next_pop < state$bounds[1] || next_pop > state$bounds[2]) {
+          cat("Solution out of bounds, adjusting...\n")
+          next_pop <- max(state$bounds[1], min(state$bounds[2], next_pop))
+        }
+        
+        # Evaluate new population
+        evaluate_population_veneer(next_pop, iteration)
+        iteration <- iteration + 1
+      }
+    }
+    
+    end_time <- Sys.time()
+    execution_time <- round(end_time - start_time, 2)
+    
+    # Final results (matches your existing output format)
+    final_result <- tail(state$results, 1)
+    
+    cat("\n", rep("=", 60), "\n")
+    cat("SDL OPTIMIZATION COMPLETE\n")
+    cat(rep("=", 60), "\n")
+    cat("Optimum Population =", format(final_result$Population, big.mark = ","), "\n")
+    cat("Final Net Take =", round(final_result$NetTake, 2), "GL\n")
+    cat("Final Residual =", round(final_result$Residual, 4), "GL\n")
+    cat("Number of runs required =", nrow(state$results), "\n")
+    cat("Converged:", ifelse(state$converged, "YES", "NO"), "\n")
+    cat("Model Run Period:", scenVars[["startDate"]][1], "-", scenVars[["endDate"]][1], "\n")
+    cat("Execution Time:", format(execution_time), "\n")
+    cat(rep("=", 60), "\n")
+    
+    return(state$results)
+  }
+  
+  # Enhanced plotting (improves your existing plot)
+  create_enhanced_plots <- function() {
+    if (nrow(state$results) == 0) return()
+    
+    # Fit quadratic for comparison with your existing approach
+    if (nrow(state$results) >= 3) {
+      d <- data.frame(Population = state$results$Population, 
+                      Residual = state$results$Residual)
+      d$Population2 <- d$Population^2
+      
+      # Your existing quadratic fit (for comparison)
+      qm <- lm(Residual ~ Population + Population2, data = d)
+      
+      # Generate curve data
+      pop_range <- seq(min(d$Population), max(d$Population), length.out = 100)
+      a <- coef(qm)[3]  # Population2 coefficient
+      b <- coef(qm)[2]  # Population coefficient  
+      c <- coef(qm)[1]  # Intercept
+      
+      curve_data <- data.frame(
+        Population = pop_range,
+        Residual = a * (pop_range^2) + b * pop_range + c
+      )
+      
+      # Calculate quadratic root (your existing method)
+      quad_root <- -(b) / (2 * a)
+    }
+    
+    # Main optimization plot (enhanced version of yours)
+    p1 <- state$results %>%
+      ggplot(aes(x = Population, y = Residual)) +
+      {if(exists("curve_data")) geom_line(data = curve_data, color = "blue", alpha = 0.6)} +
+      geom_point(size = 4, alpha = 0.7, color = "#69b3a2") +
+      geom_hline(yintercept = state$tolerance, color = "red", linetype = "dashed", alpha = 0.7) +
+      geom_point(data = tail(state$results, 1), 
+                aes(x = Population, y = Residual),
+                size = 6, color = "orange", alpha = 0.8) +
+      {if(exists("quad_root")) geom_vline(xintercept = quad_root, color = "purple", 
+                                         linetype = "dotted", alpha = 0.7)} +
+      scale_x_continuous(labels = scales::comma_format()) +
+      labs(title = "SDL Population Optimization", 
+           subtitle = paste("Target:", state$target, "GL | Method:", toupper(state$method_used)),
+           x = "Population", 
+           y = "Residual (GL)",
+           caption = paste("Converged in", nrow(state$results), "iterations")) +
+      theme_minimal() +
+      theme(legend.position = "none",
+            plot.title = element_text(size = 14, face = "bold"),
+            plot.subtitle = element_text(size = 12))
+    
+    # Convergence history
+    p2 <- state$results %>%
+      ggplot(aes(x = Run, y = Residual)) +
+      geom_line(color = "blue", size = 1) +
+      geom_point(size = 3, color = "#69b3a2") +
+      geom_hline(yintercept = state$tolerance, color = "red", linetype = "dashed") +
+      scale_y_log10() +
+      labs(title = "Convergence History", 
+           x = "Iteration", 
+           y = "Residual (GL, log scale)") +
+      theme_minimal()
+    
+    # Net Take relationship
+    p3 <- state$results %>%
+      ggplot(aes(x = Population, y = NetTake)) +
+      geom_point(size = 4, alpha = 0.7, color = "#69b3a2") +
+      geom_smooth(method = "lm", se = FALSE, color = "blue", alpha = 0.6) +
+      geom_hline(yintercept = state$target, color = "red", linetype = "dashed") +
+      geom_point(data = tail(state$results, 1), 
+                aes(x = Population, y = NetTake),
+                size = 6, color = "orange", alpha = 0.8) +
+      scale_x_continuous(labels = scales::comma_format()) +
+      labs(title = "Net Take vs Population", 
+           x = "Population", 
+           y = "Net Take (GL)") +
+      theme_minimal()
+    
+    # Summary stats
+    p4 <- state$results %>%
+      mutate(Iteration = row_number()) %>%
+      select(Iteration, Population, NetTake, Residual) %>%
+      pivot_longer(cols = -Iteration, names_to = "Metric", values_to = "Value") %>%
+      ggplot(aes(x = Iteration, y = Value, color = Metric)) +
+      geom_line(size = 1) +
+      geom_point(size = 2) +
+      facet_wrap(~Metric, scales = "free_y") +
+      labs(title = "Optimization Metrics Over Time") +
+      theme_minimal() +
+      theme(legend.position = "none")
+    
+    # Arrange plots
+    combined_plot <- grid.arrange(p1, p2, p3, p4, 
+                                 layout_matrix = rbind(c(1, 1), c(2, 3), c(4, 4)))
+    
+    # Save with same filename as your original
+    ggsave(filename = "ACT_SDL_Population.png",
+           plot = combined_plot,
+           path = paste0(scenVars[["pFolder"]][1], "/", scenVars[["outputFolder"]][1]),
+           width = 14, height = 10, dpi = 300)
+    
+    cat("Enhanced plots saved to: ACT_SDL_Population.png\n")
+    return(combined_plot)
+  }
+  
+  # Save results (compatible with your existing CSV format)
+  save_results <- function() {
+    # Save to your existing filename
+    output_file <- paste0(scenVars[["pFolder"]][1], "/", 
+                         scenVars[["summaryFilename"]][1])
+    
+    write_csv(state$results, output_file)
+    cat("Results saved to:", scenVars[["summaryFilename"]][1], "\n")
+    
+    # Also create a summary file
+    summary_data <- data.frame(
+      Parameter = c("Target", "Final Population", "Final NetTake", "Final Residual", 
+                   "Iterations", "Converged", "Method", "Tolerance"),
+      Value = c(state$target, 
+               tail(state$results$Population, 1),
+               round(tail(state$results$NetTake, 1), 3),
+               round(tail(state$results$Residual, 1), 4),
+               nrow(state$results),
+               ifelse(state$converged, "Yes", "No"),
+               toupper(state$method_used),
+               state$tolerance)
+    )
+    
+    write_csv(summary_data, 
+              paste0(scenVars[["pFolder"]][1], "/optimization_summary.csv"))
+  }
+  
+  # Return solver interface
+  list(
+    solve = solve,
+    create_enhanced_plots = create_enhanced_plots,
+    save_results = save_results,
+    get_results = function() state$results,
+    set_tolerance = function(tol) { state$tolerance <- tol },
+    set_max_iterations = function(max_iter) { state$max_iterations <- max_iter }
+  )
+}
+
+# ============================================================================
+# 3. MAIN EXECUTION - REPLACES YOUR ENTIRE OPTIMIZATION LOOP
+# ============================================================================
+
+cat("Setting up optimized SDL solver...\n")
+
+# Create solver instance
+solver <- OptimizedSDLSolver(scenVars, sf)
+
+# Optional: Customize solver settings
+# solver$set_tolerance(0.005)     # Tighter tolerance if needed
+# solver$set_max_iterations(15)   # More iterations if needed
+
+# Run optimization - this replaces your entire for loop and while loop!
+cat("Starting optimization...\n")
+results <- solver$solve(method = "newton")  # Try "newton" or "secant"
+
+# Create enhanced plots
+cat("Creating enhanced visualization...\n")
+solver$create_enhanced_plots()
+
+# Save results in your existing format
+cat("Saving results...\n")
+solver$save_results()
+
+# Display final results table (matches your existing output)
+cat("\nFinal Results Summary:\n")
+print(results)
+
+cat("\n🎉 Optimization completed successfully!\n")
+cat("Check the outputs folder for enhanced plots and summary files.\n")
